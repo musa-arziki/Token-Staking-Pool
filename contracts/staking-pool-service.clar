@@ -1,12 +1,8 @@
 ;; Token Staking Pool Contract
-;; A production-ready staking contract with fixed rewards and extensible architecture
+;; A production-ready staking contract with built-in token for testing
 
-;; ===========================================
-;; CONSTANTS AND ERROR CODES
-;; ===========================================
-
+;; Constants and Error Codes
 (define-constant CONTRACT_OWNER tx-sender)
-(define-constant STAKING_TOKEN 'SP1H1733V5MZ3SZ9XRW9FKYGEZT0JDGEB8Y634C7R.miamicoin-token)
 
 ;; Error codes
 (define-constant ERR_UNAUTHORIZED (err u100))
@@ -18,6 +14,9 @@
 (define-constant ERR_INSUFFICIENT_POOL_BALANCE (err u106))
 (define-constant ERR_INVALID_PERIOD (err u107))
 
+;; Token constants
+(define-constant TOKEN_TOTAL_SUPPLY u100000000000000) ;; 100M tokens with 6 decimals
+
 ;; Staking parameters
 (define-constant MIN_STAKE_AMOUNT u1000000) ;; 1 token (assuming 6 decimals)
 (define-constant REWARD_RATE u5) ;; 5% annual reward rate (500 basis points)
@@ -25,15 +24,15 @@
 (define-constant BLOCKS_PER_YEAR u52560) ;; Approximate blocks per year (10 min blocks)
 (define-constant MIN_STAKING_PERIOD u1440) ;; Minimum 1 day (144 blocks * 10)
 
-;; ===========================================
-;; DATA STRUCTURES
-;; ===========================================
-
-;; Pool configuration
+;; Data Variables
 (define-data-var pool-active bool true)
 (define-data-var total-staked uint u0)
 (define-data-var total-rewards-distributed uint u0)
 (define-data-var pool-balance uint u0)
+(define-data-var token-total-supply uint TOKEN_TOTAL_SUPPLY)
+
+;; Token balances map
+(define-map token-balances principal uint)
 
 ;; User stakes mapping
 (define-map stakes
@@ -56,9 +55,18 @@
     }
 )
 
-;; ===========================================
-;; READ-ONLY FUNCTIONS
-;; ===========================================
+;; Initialize contract - give deployer initial token supply
+(map-set token-balances CONTRACT_OWNER TOKEN_TOTAL_SUPPLY)
+
+;; Get current block height using burn-block-height as a proxy
+(define-read-only (get-current-block-height)
+    burn-block-height
+)
+
+;; Get token balance
+(define-read-only (get-token-balance (account principal))
+    (default-to u0 (map-get? token-balances account))
+)
 
 ;; Get stake information for a user
 (define-read-only (get-stake (staker principal))
@@ -78,7 +86,7 @@
     (match (map-get? stakes { staker: staker })
         stake-data
         (let (
-            (current-block (stacks-block-height))
+            (current-block (get-current-block-height))
             (blocks-since-last-claim (- current-block (get last-claim-block stake-data)))
             (stake-amount (get amount stake-data))
         )
@@ -102,7 +110,7 @@
 (define-read-only (can-unstake (staker principal))
     (match (map-get? stakes { staker: staker })
         stake-data
-        (>= (- (stacks-block-height) (get start-block stake-data)) MIN_STAKING_PERIOD)
+        (>= (- (get-current-block-height) (get start-block stake-data)) MIN_STAKING_PERIOD)
         false
     )
 )
@@ -119,10 +127,6 @@
         min-period: MIN_STAKING_PERIOD
     }
 )
-
-;; ===========================================
-;; PRIVATE FUNCTIONS
-;; ===========================================
 
 ;; Update user statistics
 (define-private (update-user-stats (user principal) (staked-amount uint) (claimed-amount uint))
@@ -143,28 +147,48 @@
     )
 )
 
-;; Transfer tokens with error handling
-(define-private (safe-token-transfer (amount uint) (sender principal) (recipient principal))
-    (contract-call? STAKING_TOKEN transfer amount sender recipient none)
+;; Internal token transfer function
+(define-private (token-transfer (amount uint) (sender principal) (recipient principal))
+    (let (
+        (sender-balance (get-token-balance sender))
+        (recipient-balance (get-token-balance recipient))
+    )
+        (asserts! (>= sender-balance amount) ERR_INSUFFICIENT_BALANCE)
+        (map-set token-balances sender (- sender-balance amount))
+        (map-set token-balances recipient (+ recipient-balance amount))
+        (ok true)
+    )
 )
 
-;; ===========================================
-;; PUBLIC FUNCTIONS
-;; ===========================================
+;; Public token transfer (for users to move tokens)
+(define-public (transfer (amount uint) (recipient principal))
+    (token-transfer amount tx-sender recipient)
+)
+
+;; Mint tokens (only owner, for testing)
+(define-public (mint (amount uint) (recipient principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (map-set token-balances recipient (+ (get-token-balance recipient) amount))
+        (var-set token-total-supply (+ (var-get token-total-supply) amount))
+        (ok true)
+    )
+)
 
 ;; Stake tokens
 (define-public (stake (amount uint))
     (let (
         (staker tx-sender)
-        (current-block (stacks-block-height))
+        (current-block (get-current-block-height))
     )
         ;; Validation checks
         (asserts! (var-get pool-active) ERR_POOL_NOT_ACTIVE)
         (asserts! (>= amount MIN_STAKE_AMOUNT) ERR_INVALID_AMOUNT)
         (asserts! (is-none (map-get? stakes { staker: staker })) ERR_INVALID_AMOUNT) ;; No existing stake
+        (asserts! (>= (get-token-balance staker) amount) ERR_INSUFFICIENT_BALANCE)
 
         ;; Transfer tokens to contract
-        (try! (safe-token-transfer amount staker (as-contract tx-sender)))
+        (try! (token-transfer amount staker (as-contract tx-sender)))
 
         ;; Create stake record
         (map-set stakes
@@ -195,7 +219,7 @@
 (define-public (claim-rewards)
     (let (
         (staker tx-sender)
-        (current-block (stacks-block-height))
+        (current-block (get-current-block-height))
     )
         (match (map-get? stakes { staker: staker })
             stake-data
@@ -208,7 +232,7 @@
                 (asserts! (>= (var-get pool-balance) pending-rewards) ERR_INSUFFICIENT_POOL_BALANCE)
 
                 ;; Transfer rewards to staker
-                (try! (as-contract (safe-token-transfer pending-rewards tx-sender staker)))
+                (try! (as-contract (token-transfer pending-rewards tx-sender staker)))
 
                 ;; Update stake record
                 (map-set stakes
@@ -241,7 +265,7 @@
 (define-public (unstake)
     (let (
         (staker tx-sender)
-        (current-block (stacks-block-height))
+        (current-block (get-current-block-height))
     )
         (match (map-get? stakes { staker: staker })
             stake-data
@@ -255,9 +279,9 @@
                 (asserts! (>= (var-get pool-balance) pending-rewards) ERR_INSUFFICIENT_POOL_BALANCE)
 
                 ;; Transfer stake + rewards back to staker
-                (try! (as-contract (safe-token-transfer stake-amount tx-sender staker)))
+                (try! (as-contract (token-transfer stake-amount tx-sender staker)))
                 (if (> pending-rewards u0)
-                    (try! (as-contract (safe-token-transfer pending-rewards tx-sender staker)))
+                    (try! (as-contract (token-transfer pending-rewards tx-sender staker)))
                     true
                 )
 
@@ -281,15 +305,11 @@
     )
 )
 
-;; ===========================================
-;; ADMIN FUNCTIONS
-;; ===========================================
-
 ;; Add rewards to the pool (only contract owner)
 (define-public (fund-pool (amount uint))
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-        (try! (safe-token-transfer amount tx-sender (as-contract tx-sender)))
+        (try! (token-transfer amount tx-sender (as-contract tx-sender)))
         (var-set pool-balance (+ (var-get pool-balance) amount))
         (ok { amount-added: amount, new-balance: (var-get pool-balance) })
     )
@@ -311,7 +331,7 @@
         (asserts! (not (var-get pool-active)) ERR_POOL_NOT_ACTIVE)
         (asserts! (<= amount (var-get pool-balance)) ERR_INSUFFICIENT_POOL_BALANCE)
 
-        (try! (as-contract (safe-token-transfer amount tx-sender CONTRACT_OWNER)))
+        (try! (as-contract (token-transfer amount tx-sender CONTRACT_OWNER)))
         (var-set pool-balance (- (var-get pool-balance) amount))
         (ok { withdrawn: amount })
     )
